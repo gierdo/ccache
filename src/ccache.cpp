@@ -401,7 +401,9 @@ guess_compiler(const char* path)
 {
   string_view name = Util::base_name(path);
   GuessedCompiler result = GuessedCompiler::unknown;
-  if (name == "clang") {
+  if (name == "clang-tidy") {
+    result = GuessedCompiler::clang_tidy;
+  } else if (name == "clang") {
     result = GuessedCompiler::clang;
   } else if (name == "gcc" || name == "g++") {
     result = GuessedCompiler::gcc;
@@ -1040,8 +1042,15 @@ to_cache(Context& ctx,
          Args& depend_extra_args,
          struct hash* depend_mode_hash)
 {
-  args_add(args, "-o");
-  args_add(args, ctx.args_info.output_obj.c_str());
+  const bool is_clang_tidy =
+    (ctx.guessed_compiler == GuessedCompiler::clang_tidy);
+
+  int args_to_pop = 0;
+  if (!is_clang_tidy) {
+    args_add(args, "-o");
+    args_add(args, ctx.args_info.output_obj.c_str());
+    args_to_pop += 2;
+  }
 
   if (ctx.config.hard_link() && ctx.args_info.output_obj != "/dev/null") {
     // Workaround for Clang bug where it overwrites an existing object file
@@ -1067,6 +1076,7 @@ to_cache(Context& ctx,
   } else {
     args_add(args, ctx.i_tmpfile.c_str());
   }
+  ++args_to_pop;
 
   if (ctx.args_info.seen_split_dwarf) {
     // Remove any pre-existing .dwo file since we want to check if the compiler
@@ -1095,7 +1105,7 @@ to_cache(Context& ctx,
     tmp_stderr_fd = create_tmp_fd(&tmp_stderr);
     status = execute(
       args.to_argv().data(), tmp_stdout_fd, tmp_stderr_fd, &compiler_pid);
-    args_pop(args, 3);
+    args_pop(args, args_to_pop);
   } else {
     // The cached result path is not known yet, use temporary files.
     tmp_stdout = format("%s/tmp.stdout", temp_dir(ctx));
@@ -1210,24 +1220,29 @@ to_cache(Context& ctx,
   }
 
   st = Stat::stat(ctx.args_info.output_obj);
-  if (!st) {
-    cc_log("Compiler didn't produce an object file");
-    failed(STATS_NOOUTPUT);
-  }
-  if (st.size() == 0) {
-    cc_log("Compiler produced an empty object file");
-    failed(STATS_EMPTYOUTPUT);
+  if (!is_clang_tidy) {
+    if (!st) {
+      cc_log("Compiler didn't produce an object file");
+      failed(STATS_NOOUTPUT);
+    }
+    if (st.size() == 0) {
+      cc_log("Compiler produced an empty object file");
+      failed(STATS_EMPTYOUTPUT);
+    }
   }
 
   st = Stat::stat(tmp_stderr, Stat::OnError::log);
   if (!st) {
     failed(STATS_ERROR);
   }
+
   ResultFileMap result_file_map;
   if (st.size() > 0) {
     result_file_map.emplace(FileType::stderr_output, tmp_stderr);
   }
-  result_file_map.emplace(FileType::object, ctx.args_info.output_obj);
+  if (!is_clang_tidy) {
+    result_file_map.emplace(FileType::object, ctx.args_info.output_obj);
+  }
   if (ctx.args_info.generating_dependencies) {
     result_file_map.emplace(FileType::dependency, ctx.args_info.output_dep);
   }
@@ -1295,6 +1310,9 @@ to_cache(Context& ctx,
 static struct digest*
 get_result_name_from_cpp(Context& ctx, Args& args, struct hash* hash)
 {
+  const bool is_clang_tidy =
+    (ctx.guessed_compiler == GuessedCompiler::clang_tidy);
+
   ctx.time_of_compilation = time(nullptr);
 
   char* path_stderr = nullptr;
@@ -1314,27 +1332,32 @@ get_result_name_from_cpp(Context& ctx, Args& args, struct hash* hash)
       Util::get_truncated_base_name(ctx.args_info.input_file, 10);
     path_stdout =
       x_strdup(fmt::format("{}/{}.stdout", temp_dir(ctx), input_base).c_str());
-    int path_stdout_fd = create_tmp_fd(&path_stdout);
     add_pending_tmp_file(path_stdout);
+    int path_stdout_fd = create_tmp_fd(&path_stdout);
 
     path_stderr = format("%s/tmp.cpp_stderr", temp_dir(ctx));
-    int path_stderr_fd = create_tmp_fd(&path_stderr);
     add_pending_tmp_file(path_stderr);
-
-    int args_added = 2;
-    args_add(args, "-E");
-    if (ctx.config.keep_comments_cpp()) {
-      args_add(args, "-C");
-      args_added = 3;
-    }
-    args_add(args, ctx.args_info.input_file.c_str());
+    int path_stderr_fd = create_tmp_fd(&path_stderr);
     add_prefix(ctx, args, ctx.config.prefix_command_cpp());
-    cc_log("Running preprocessor");
-    MTR_BEGIN("execute", "preprocessor");
-    status = execute(
-      args.to_argv().data(), path_stdout_fd, path_stderr_fd, &compiler_pid);
-    MTR_END("execute", "preprocessor");
-    args_pop(args, args_added);
+
+    if (is_clang_tidy) {
+      cc_log("Not Running preprocessor, I'm doing clang-tidy business.");
+      status = 0;
+    } else {
+      int args_added = 2;
+      args_add(args, "-E");
+      if (ctx.config.keep_comments_cpp()) {
+        args_add(args, "-C");
+        args_added = 3;
+      }
+      args_add(args, ctx.args_info.input_file.c_str());
+      cc_log("Running preprocessor");
+      MTR_BEGIN("execute", "preprocessor");
+      status = execute(
+        args.to_argv().data(), path_stdout_fd, path_stderr_fd, &compiler_pid);
+      MTR_END("execute", "preprocessor");
+      args_pop(args, args_added);
+    }
   }
 
   if (status != 0) {
@@ -1343,12 +1366,22 @@ get_result_name_from_cpp(Context& ctx, Args& args, struct hash* hash)
   }
 
   hash_delimiter(hash, "cpp");
-  if (!process_preprocessed_file(ctx,
-                                 hash,
-                                 path_stdout,
-                                 ctx.guessed_compiler
-                                   == GuessedCompiler::pump)) {
-    failed(STATS_ERROR);
+  if (is_clang_tidy) {
+    if (!process_preprocessed_file(ctx,
+                                   hash,
+                                   ctx.args_info.input_file.c_str(),
+                                   ctx.guessed_compiler
+                                     == GuessedCompiler::pump)) {
+      failed(STATS_ERROR);
+    }
+  } else {
+    if (!process_preprocessed_file(ctx,
+                                   hash,
+                                   path_stdout,
+                                   ctx.guessed_compiler
+                                     == GuessedCompiler::pump)) {
+      failed(STATS_ERROR);
+    }
   }
 
   hash_delimiter(hash, "cppstderr");
@@ -2926,7 +2959,8 @@ process_args(Context& ctx,
     return STATS_CANTUSEPCH;
   }
 
-  if (!found_c_opt && !found_dc_opt && !found_S_opt) {
+  if (!found_c_opt && !found_dc_opt && !found_S_opt
+      && !(ctx.guessed_compiler == GuessedCompiler::clang_tidy)) {
     if (args_info.output_is_precompiled_header) {
       args_add(common_args, "-c");
     } else {
