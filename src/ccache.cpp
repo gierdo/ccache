@@ -45,6 +45,8 @@
 #include "third_party/minitrace.h"
 #include "third_party/nonstd/string_view.hpp"
 
+#include <string>
+
 #ifdef HAVE_GETOPT_LONG
 #  include <getopt.h>
 #else
@@ -401,7 +403,7 @@ guess_compiler(const char* path)
 {
   string_view name = Util::base_name(path);
   GuessedCompiler result = GuessedCompiler::unknown;
-  if (name == "clang-tidy") {
+  if (name.starts_with("clang-tidy")) {
     result = GuessedCompiler::clang_tidy;
   } else if (name == "clang") {
     result = GuessedCompiler::clang;
@@ -1138,7 +1140,8 @@ to_cache(Context& ctx,
 
   // distcc-pump outputs lines like this:
   // __________Using # distcc servers in pump mode
-  if (st.size() != 0 && ctx.guessed_compiler != GuessedCompiler::pump) {
+  if (st.size() != 0 && ctx.guessed_compiler != GuessedCompiler::pump
+      && !is_clang_tidy) {
     cc_log("Compiler produced stdout");
     tmp_unlink(tmp_stdout);
     tmp_unlink(tmp_stderr);
@@ -1186,7 +1189,9 @@ to_cache(Context& ctx,
     free(tmp_stderr2);
   }
 
-  if (status != 0) {
+  ResultFileMap result_file_map;
+
+  if ((status != 0) && !is_clang_tidy) {
     cc_log("Compiler gave exit status %d", status);
 
     int fd = open(tmp_stderr, O_RDONLY | O_BINARY);
@@ -1236,7 +1241,6 @@ to_cache(Context& ctx,
     failed(STATS_ERROR);
   }
 
-  ResultFileMap result_file_map;
   if (st.size() > 0) {
     result_file_map.emplace(FileType::stderr_output, tmp_stderr);
   }
@@ -2921,7 +2925,8 @@ process_args(Context& ctx,
 
   if (found_pch || found_fpch_preprocess) {
     args_info.using_precompiled_header = true;
-    if (!(config.sloppiness() & SLOPPY_TIME_MACROS)) {
+    if (!(config.sloppiness() & SLOPPY_TIME_MACROS)
+        && (ctx.guessed_compiler != GuessedCompiler::clang_tidy)) {
       cc_log(
         "You have to specify \"time_macros\" sloppiness when using"
         " precompiled headers to get direct hits");
@@ -2952,7 +2957,8 @@ process_args(Context& ctx,
     args_info.actual_language.find("-header") != std::string::npos;
 
   if (args_info.output_is_precompiled_header
-      && !(config.sloppiness() & SLOPPY_PCH_DEFINES)) {
+      && !(config.sloppiness() & SLOPPY_PCH_DEFINES)
+      && (ctx.guessed_compiler != GuessedCompiler::clang_tidy)) {
     cc_log(
       "You have to specify \"pch_defines,time_macros\" sloppiness when"
       " creating precompiled headers");
